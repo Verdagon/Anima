@@ -1,4 +1,5 @@
 from sys import platform
+import sys
 
 is_on_mac_os = False
 

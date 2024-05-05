@@ -249,25 +249,29 @@ class AirLLMLlamaMlx:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
 
-    def generate(self, x, temperature=0, max_new_tokens=None, **kwargs):
-        tokens = []
-        for token in self.model_generate(x, temperature=temperature):
-            tokens.append(token)
+    def generate(self, x_arr, temperature=0, max_new_tokens=None, **kwargs):
+        tokens_arr = [[] for x in x_arr]
+        for token_arr in self.model_generate(x_arr, temperature=temperature):
+            for i in range(len(x_arr)):
+                tokens_arr[i].append(token_arr[i])
 
-
-            if len(tokens) >= max_new_tokens:
+            if len(tokens_arr[0]) >= max_new_tokens:
                 break
 
+        s_arr = [self.tokenizer.decode([t.item() for t in tokens]) for tokens in tokens_arr]
+        return s_arr
 
-        s = self.tokenizer.decode([t.item() for t in tokens])
-        return s
-
-    def model_generate(self, x, temperature=0, max_new_tokens=None):
-        cache = []
+    def model_generate(self, x_arr, temperature=0, max_new_tokens=None):
+        x_and_layers_and_mask_and_cache_arr = []
+        for x in x_arr:
+          x_and_layers_and_mask_and_cache_arr.append((
+            x,
+            None,
+            # Make an additive causal mask. We will need that to process the prompt.
+            nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1]),
+            []))
+          
         TEST_NO_LAYERED = True
-
-        # Make an additive causal mask. We will need that to process the prompt.
-        mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
 
         # First we process the prompt x the same was as in __call__ but
         # save the caches in cache
@@ -275,7 +279,10 @@ class AirLLMLlamaMlx:
         self.record_memory('before_tok_embeddings')
         self.tok_embeddings = nn.Embedding(self.model_args.vocab_size, self.model_args.dim)
         #w0 = self.tok_embeddings.weight[0][0]
-        mask = mask.astype(self.tok_embeddings.weight.dtype)
+
+        for i, (x, layers, mask, cache) in enumerate(x_and_layers_and_mask_and_cache_arr):
+          mask = mask.astype(self.tok_embeddings.weight.dtype)
+          x_and_layers_and_mask_and_cache_arr[i] = (x, layers, mask, cache)
 
         self.record_memory('before_loading_tok')
         update_weights = ModelPersister.get_model_persister().load_model(self.layer_names_dict['embed'], self.checkpoint_path)
@@ -286,9 +293,12 @@ class AirLLMLlamaMlx:
 
         #assert w0 != w1, f"weight should change after updates, weights: {update_weights}"
 
-        x = self.tok_embeddings(x)
-        # force execution
-        mx.eval(x)
+
+        for i, (x, layers, mask, cache) in enumerate(x_and_layers_and_mask_and_cache_arr):
+          x = self.tok_embeddings(x)
+          # force execution
+          mx.eval(x)
+          x_and_layers_and_mask_and_cache_arr[i] = (x, layers, mask, cache)
 
         if not self.test_nonlayered:
 
@@ -303,23 +313,36 @@ class AirLLMLlamaMlx:
 
         for il in tqdm(range(self.model_args.n_layers), desc='running layers'):
             self.record_memory(f'before layer {il}')
-            l = TransformerBlock(args=self.model_args)
-            l.update(
-                ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{il}',
-                                                                     self.checkpoint_path)['layers'][il]
-            )
+            layer_weights = (
+                (
+                    ModelPersister.get_model_persister().load_model(
+                                    f'{self.layer_names_dict["layer_prefix"]}.{il}',
+                                    self.checkpoint_path)
+                )['layers'][il])
+            
 
-            x, c = l(x, mask=mask)
-            # force execution
-            mx.eval(x)
-            # We store the per layer cache in a simple python list
-            cache.append(c)
+            for i, (x, layers, mask, cache) in enumerate(x_and_layers_and_mask_and_cache_arr):
+              print(f"Iteration {i} for layer {il}")
+              l = TransformerBlock(args=self.model_args)
+              l.update(layer_weights)
+              # Note we're updating c in this loop; the first iteration we're handing
+              # in a None, and receiving an actual instance which we hand in in the
+              # rest of the iterations.
+              x, c = l(x, mask=mask)
+              # force execution
+              mx.eval(x)
 
-            if not self.test_nonlayered:
-                del l
-                gc.collect()
-            else:
-                self.layers.append(l)
+              # TODO: arrayize self.layers
+              if not self.test_nonlayered:
+                  del l
+                  gc.collect()
+              else:
+                  layers.append(l)
+              # We store the per layer cache in a simple python list
+              cache.append(c)
+
+              x_and_layers_and_mask_and_cache_arr[i] = (x, layers, mask, cache)
+
             self.record_memory(f'after layer {il}')
 
         self.record_memory('before_norm')
@@ -327,9 +350,11 @@ class AirLLMLlamaMlx:
         self.norm.update(
             ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm']
         )
-        x = self.norm(x)
-        # force execution
-        mx.eval(x)
+        for i, (x, layers, mask, cache) in enumerate(x_and_layers_and_mask_and_cache_arr):
+          x = self.norm(x)
+          # force execution
+          mx.eval(x)
+          x_and_layers_and_mask_and_cache_arr[i] = (x, layers, mask, cache)
         if not self.test_nonlayered:
             del self.norm
             gc.collect()
@@ -341,15 +366,20 @@ class AirLLMLlamaMlx:
         self.output.update(
             ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output']
         )
-        y = self.output(x[:, -1])
-        # force execution
-        mx.eval(y)
+        x_and_layers_and_mask_and_cache_and_y_arr = []
+        for x, layers, mask, cache in x_and_layers_and_mask_and_cache_arr:
+          y = self.output(x[:, -1])
+          # force execution
+          mx.eval(y)
+          x_and_layers_and_mask_and_cache_and_y_arr.append((x, layers, mask, cache, y))
 
         if not self.test_nonlayered:
             del self.output
             gc.collect()
         self.record_memory('after_lmhead')
-        y = sample(y)
+        for i, (x, layers, mask, cache, y) in enumerate(x_and_layers_and_mask_and_cache_and_y_arr):
+          y = sample(y)
+          x_and_layers_and_mask_and_cache_and_y_arr[i] = (x, layers, mask, cache, y)
 
 
         # y now has size [1]
@@ -357,7 +387,7 @@ class AirLLMLlamaMlx:
         # Calling y.item() would force the computation to happen at
         # this point but we can also choose not to do that and let the
         # user choose when to start the computation.
-        yield y
+        yield [y for x, layers, mask, cache, y in x_and_layers_and_mask_and_cache_and_y_arr]
 
 
 
@@ -367,7 +397,9 @@ class AirLLMLlamaMlx:
         while True:
             # Unsqueezing the last dimension to add a sequence length
             # dimension of 1
-            x = y[:, None]
+            for i, (x, layers, mask, cache, y) in enumerate(x_and_layers_and_mask_and_cache_and_y_arr):
+              x = y[:, None]
+              x_and_layers_and_mask_and_cache_and_y_arr[i] = (x, layers, mask, cache, y)
 
             if not self.test_nonlayered:
                 self.record_memory('before_tok_embeddings')
@@ -378,10 +410,14 @@ class AirLLMLlamaMlx:
                 #w1 = self.tok_embeddings.weight[0][0]
 
                 #assert w0 != w1, f"weight should change after updates."
-            x = self.tok_embeddings(x)
+            for i, (x, layers, mask, cache, y) in enumerate(x_and_layers_and_mask_and_cache_and_y_arr):
+              x = self.tok_embeddings(x)
+              x_and_layers_and_mask_and_cache_and_y_arr[i] = (x, layers, mask, cache, y)
 
             # force execution
-            mx.eval(x)
+            for i, (x, layers, mask, cache, y) in enumerate(x_and_layers_and_mask_and_cache_and_y_arr):
+              mx.eval(x)
+              x_and_layers_and_mask_and_cache_and_y_arr[i] = (x, layers, mask, cache, y)
             if not self.test_nonlayered:
                 del self.tok_embeddings
                 gc.collect()
@@ -393,28 +429,40 @@ class AirLLMLlamaMlx:
                 # the computation will happen, MLX will be discarding the
                 # old cache the moment it is not needed anymore.
 
-                if not self.test_nonlayered:
-                    l = TransformerBlock(args=self.model_args)
-                    l.update(ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{i}',
-                                                                             self.checkpoint_path)['layers'][i])
-                else:
-                    l = self.layers[i]
+                layer_weights = (
+                    ModelPersister.get_model_persister().load_model(
+                        f'{self.layer_names_dict["layer_prefix"]}.{i}',
+                        self.checkpoint_path)['layers'][i]);
 
-                x, cache[i] = l(x, mask=None, cache=cache[i])
-                # force execution
-                mx.eval(x)
-                if not self.test_nonlayered:
-                    del l
-                    gc.collect()
+                for i, (x, layers, mask, cache, y) in enumerate(x_and_layers_and_mask_and_cache_and_y_arr):
+                    l = None
+                    if not self.test_nonlayered:
+                        l = TransformerBlock(args=self.model_args)
+                        l.update(layer_weights)
+                    else:
+                        l = self.layers[i]
+
+                    x, cache[i] = l(x, mask=None, cache=cache[i])
+                    # force execution
+                    mx.eval(x)
+                    if not self.test_nonlayered:
+                        del l
+                        gc.collect()
+
+                    x_and_layers_and_mask_and_cache_and_y_arr[i] = (x, layers, mask, cache, y)
+
                 self.record_memory(f'after layer {il}')
 
             self.record_memory('before_norm')
             if not self.test_nonlayered:
                 self.norm = RMSNorm(self.model_args.dim, eps=self.model_args.norm_eps)
                 self.norm.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm'])
-            x = self.norm(x)
-            # force execution
-            mx.eval(x)
+
+            for i, (x, layers, mask, cache, y) in enumerate(x_and_layers_and_mask_and_cache_and_y_arr):
+                x = self.norm(x)
+                # force execution
+                mx.eval(x)
+                x_and_layers_and_mask_and_cache_and_y_arr[i] = (x, layers, mask, cache, y)
 
             if not self.test_nonlayered:
                 del self.norm
@@ -425,13 +473,17 @@ class AirLLMLlamaMlx:
             if not self.test_nonlayered:
                 self.output = nn.Linear(self.model_args.dim, self.model_args.vocab_size, bias=False)
                 self.output.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output'])
-            y = sample(self.output(x[:, -1]))
 
-            # force execution
-            mx.eval(y)
+            for i, (x, layers, mask, cache, y) in enumerate(x_and_layers_and_mask_and_cache_and_y_arr):
+                y = sample(self.output(x[:, -1]))
+                # force execution
+                mx.eval(y)
+                x_and_layers_and_mask_and_cache_and_y_arr[i] = (x, layers, mask, cache, y)
+
             if not self.test_nonlayered:
                 del self.output
                 gc.collect()
 
             self.record_memory('after_lmhead')
-            yield y
+            
+            yield [y for x, layers, mask, cache, y in x_and_layers_and_mask_and_cache_and_y_arr]
